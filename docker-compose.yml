@@ -1,0 +1,119 @@
+services:
+  mongo:
+    image: mongo:7.0
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  kafka:
+    image: apache/kafka:4.3.1
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  topic-init:
+    image: apache/kafka:4.3.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command:
+      - /bin/bash
+      - -ec
+      - |
+        for topic in fetch_queue parse_queue validate_queue dead_letter_queue; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 \
+            --create --if-not-exists --topic "$$topic" --partitions 3 --replication-factor 1
+        done
+    restart: "no"
+
+  redis:
+    image: redis/redis-stack:7.4.0-v8
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  fetcher:
+    build:
+      context: .
+      dockerfile: Dockerfile.fetcher
+    depends_on:
+      mongo:
+        condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
+    restart: on-failure
+    volumes:
+      - html_pages:/app/html_pages
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      MONGO_URI: mongodb://mongo:27017/
+      CRAWLER_USER_AGENT: ${CRAWLER_USER_AGENT:-portfolio-wikipedia-crawler/1.0}
+      FETCH_CONCURRENCY: ${FETCH_CONCURRENCY:-5}
+      FETCH_MAX_ATTEMPTS: ${FETCH_MAX_ATTEMPTS:-3}
+      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-20}
+      REQUEST_DELAY_SECONDS: ${REQUEST_DELAY_SECONDS:-0.1}
+
+  parser:
+    build:
+      context: .
+      dockerfile: Dockerfile.parser
+    depends_on:
+      topic-init:
+        condition: service_completed_successfully
+    restart: on-failure
+    volumes:
+      - html_pages:/app/html_pages
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      PARSE_MAX_ATTEMPTS: ${PARSE_MAX_ATTEMPTS:-3}
+
+  validator:
+    build:
+      context: .
+      dockerfile: Dockerfile.validator
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
+    restart: on-failure
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      MONGO_URI: mongodb://mongo:27017/
+      REDIS_HOST: redis
+      SEED_URL: ${SEED_URL:-https://en.wikipedia.org/wiki/Book_of_Genesis}
+      RECOVERY_SCAN_LIMIT: ${RECOVERY_SCAN_LIMIT:-10000}
+      MAX_FRONTIER_URLS: ${MAX_FRONTIER_URLS:-1000}
+
+volumes:
+  mongo_data:
+  html_pages:
